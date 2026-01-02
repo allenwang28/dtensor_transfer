@@ -488,15 +488,47 @@ class Receiver(Actor):
         return len(self.ipc_chunks)
 
     @endpoint
-    def receive(self) -> None:
+    def receive(self, n_streams: int = 1) -> float:
         """
         Copy data from pre-opened IPC tensors into DTensor's local shard.
         This is the hot path - just copy_ calls.
+
+        Args:
+            n_streams: Number of CUDA streams to use for parallel copies.
+                       If 1, uses default stream (sequential).
+                       If > 1, round-robins chunks across streams for parallelism.
+
+        Returns:
+            Elapsed time in milliseconds (measured via CUDA events).
         """
         local_tensor = self.dtensor.to_local()
 
-        for chunk_tensor, receiver_slices in self.ipc_chunks:
-            local_tensor[receiver_slices].copy_(chunk_tensor)
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+
+        if n_streams <= 1:
+            # Sequential on default stream
+            start_event.record()
+            for chunk_tensor, receiver_slices in self.ipc_chunks:
+                local_tensor[receiver_slices].copy_(chunk_tensor)
+            end_event.record()
+        else:
+            # Create streams and round-robin chunks across them
+            streams = [torch.cuda.Stream() for _ in range(n_streams)]
+
+            start_event.record()
+            for i, (chunk_tensor, receiver_slices) in enumerate(self.ipc_chunks):
+                stream = streams[i % n_streams]
+                with torch.cuda.stream(stream):
+                    local_tensor[receiver_slices].copy_(chunk_tensor)
+
+            # Sync all streams back to default stream
+            for stream in streams:
+                stream.synchronize()
+            end_event.record()
+
+        torch.cuda.synchronize()
+        return start_event.elapsed_time(end_event)  # ms
 
     @endpoint
     def clear_tensor(self) -> None:
@@ -533,9 +565,10 @@ def main():
     # Configuration
     n_senders = 2
     n_receivers = 2
-    tensor_shape = (1024, 1024)
+    tensor_shape = (16384, 16384)  # 1 GB tensor (16384 * 16384 * 4 bytes)
     n_warmup = 2
     n_iterations = 10
+    n_streams = 2  # Number of CUDA streams for parallel copies
 
     sender_shard_dim = 0  # Shard(0) - row-wise
     receiver_shard_dim = 1  # Shard(1) - column-wise
@@ -549,6 +582,7 @@ def main():
     logger.info(f"Senders: {n_senders} (GPUs {sender_gpu_ids})")
     logger.info(f"Receivers: {n_receivers} (GPUs {receiver_gpu_ids})")
     logger.info(f"Tensor shape: {tensor_shape}")
+    logger.info(f"CUDA streams: {n_streams}")
     logger.info(
         f"Tensor size: {tensor_shape[0] * tensor_shape[1] * 4 / 1024 / 1024:.2f} MB"
     )
@@ -600,7 +634,7 @@ def main():
     )
     logger.info(f"Created original tensor with shape {original.shape}")
 
-    # Spawn proc meshes
+    # Spawn both proc meshes in parallel
     logger.info("--- Spawning proc meshes ---")
     host = this_host()
 
@@ -608,15 +642,34 @@ def main():
         per_host={"gpu": n_senders},
         bootstrap=partial(set_cuda_device, sender_gpu_ids),
     )
-    logger.info("Sender procs created")
+    receiver_procs = host.spawn_procs(
+        per_host={"gpu": n_receivers},
+        bootstrap=partial(set_cuda_device, receiver_gpu_ids),
+    )
+    logger.info("Sender and receiver procs created")
 
+    # Setup distributed env for both in parallel
     setup_torch_elastic_env(sender_procs)
-    senders = sender_procs.spawn("senders", Sender, original)
+    setup_torch_elastic_env(receiver_procs)
 
-    logger.info("--- Creating DTensor with Shard(0) ---")
-    sender_shapes = senders.setup_and_create_dtensor.call().get()
+    # Spawn actors
+    senders = sender_procs.spawn("senders", Sender, original)
+    receivers = receiver_procs.spawn(
+        "receivers", Receiver, tensor_shape, original.dtype
+    )
+
+    # Initialize both sender and receiver DTensors in parallel
+    logger.info("--- Creating DTensors ---")
+    sender_init_future = senders.setup_and_create_dtensor.call()
+    receiver_init_future = receivers.init_and_create_dtensor.call()
+
+    sender_shapes = sender_init_future.get()
     for proc_info, shape in sender_shapes:
-        logger.info(f"  Sender rank {proc_info.rank}: local shape {shape}")
+        logger.info(f"  Sender rank {proc_info.rank}: local shape {shape} (Shard(0))")
+
+    receiver_shapes = receiver_init_future.get()
+    for proc_info, shape in receiver_shapes:
+        logger.info(f"  Receiver rank {proc_info.rank}: local shape {shape} (Shard(1))")
 
     # Have each sender prepare its chunks
     logger.info("--- Senders preparing chunks ---")
@@ -648,24 +701,6 @@ def main():
     for recv_rank, handles in receiver_chunk_handles.items():
         logger.info(f"  Receiver {recv_rank} will receive {len(handles)} chunk handles")
 
-    # Spawn receivers
-    receiver_procs = host.spawn_procs(
-        per_host={"gpu": n_receivers},
-        bootstrap=partial(set_cuda_device, receiver_gpu_ids),
-    )
-    logger.info("Receiver procs created")
-
-    setup_torch_elastic_env(receiver_procs)
-    receivers = receiver_procs.spawn(
-        "receivers", Receiver, tensor_shape, original.dtype
-    )
-
-    # Initialize and create DTensor with Shard(1) upfront
-    logger.info("--- Creating receiver DTensors with Shard(1) ---")
-    receiver_shapes = receivers.init_and_create_dtensor.call().get()
-    for proc_info, shape in receiver_shapes:
-        logger.info(f"  Receiver rank {proc_info.rank}: local shape {shape}")
-
     # Set up IPC handles once (open handles and store references)
     logger.info("--- Setting up IPC handles on receivers ---")
     for recv_rank in range(n_receivers):
@@ -680,13 +715,12 @@ def main():
         # Clear tensors before transfer
         receivers.clear_tensor.call().get()
 
-        start_time = time.perf_counter()
-
-        # Only time the actual transfer - now just copy_ calls
-        receivers.receive.call().get()
-
-        elapsed = time.perf_counter() - start_time
-        logger.info(f"  Warmup {i + 1}: {elapsed * 1000:.2f} ms")
+        # receive() now returns CUDA-timed elapsed ms from each receiver
+        results = receivers.receive.call(n_streams).get()
+        # Take max across receivers (transfer complete when slowest finishes)
+        cuda_times = [elapsed_ms for _, elapsed_ms in results]
+        max_cuda_time = max(cuda_times)
+        logger.info(f"  Warmup {i + 1}: {max_cuda_time:.3f} ms (CUDA timed)")
 
     # Benchmark iterations
     logger.info(f"--- Benchmark ({n_iterations} iterations) ---")
@@ -695,19 +729,18 @@ def main():
         # Clear tensors before transfer
         receivers.clear_tensor.call().get()
 
-        start_time = time.perf_counter()
-
-        # Only time the actual transfer - now just copy_ calls
-        receivers.receive.call().get()
-
-        elapsed = time.perf_counter() - start_time
-        times.append(elapsed)
-        logger.info(f"  Iteration {i + 1}: {elapsed * 1000:.2f} ms")
+        # receive() now returns CUDA-timed elapsed ms from each receiver
+        results = receivers.receive.call(n_streams).get()
+        # Take max across receivers (transfer complete when slowest finishes)
+        cuda_times = [elapsed_ms for _, elapsed_ms in results]
+        max_cuda_time = max(cuda_times)
+        times.append(max_cuda_time)
+        logger.info(f"  Iteration {i + 1}: {max_cuda_time:.3f} ms (CUDA timed)")
 
     # Print benchmark results
     import statistics
 
-    times_ms = [t * 1000 for t in times]
+    times_ms = times  # Already in ms from CUDA events
     avg_time = statistics.mean(times_ms)
     min_time = min(times_ms)
     max_time = max(times_ms)
@@ -718,30 +751,31 @@ def main():
     p75 = sorted_times[(3 * len(sorted_times)) // 4]
     p90 = sorted_times[int(len(sorted_times) * 0.9)]
     tensor_size_mb = tensor_shape[0] * tensor_shape[1] * 4 / 1024 / 1024
-    throughput = tensor_size_mb / (avg_time / 1000)
+    throughput_mbs = tensor_size_mb / (avg_time / 1000)  # MB/s
+    throughput_gbs = throughput_mbs / 1024  # GB/s
 
     logger.info("=" * 60)
-    logger.info("BENCHMARK RESULTS")
+    logger.info("BENCHMARK RESULTS (CUDA Event Timing)")
     logger.info("=" * 60)
     logger.info(f"Tensor size:     {tensor_size_mb:.2f} MB")
     logger.info(f"Iterations:      {n_iterations}")
     logger.info("")
     logger.info("All times (ms):")
     for i, t in enumerate(times_ms):
-        logger.info(f"  [{i+1:2d}] {t:8.2f} ms")
+        logger.info(f"  [{i+1:2d}] {t:8.3f} ms")
     logger.info("")
     logger.info("Distribution (ms):")
-    logger.info(f"  Min:           {min_time:.2f}")
-    logger.info(f"  P25:           {p25:.2f}")
-    logger.info(f"  Median (P50):  {median_time:.2f}")
-    logger.info(f"  P75:           {p75:.2f}")
-    logger.info(f"  P90:           {p90:.2f}")
-    logger.info(f"  Max:           {max_time:.2f}")
+    logger.info(f"  Min:           {min_time:.3f}")
+    logger.info(f"  P25:           {p25:.3f}")
+    logger.info(f"  Median (P50):  {median_time:.3f}")
+    logger.info(f"  P75:           {p75:.3f}")
+    logger.info(f"  P90:           {p90:.3f}")
+    logger.info(f"  Max:           {max_time:.3f}")
     logger.info("")
-    logger.info(f"  Mean:          {avg_time:.2f}")
-    logger.info(f"  Std Dev:       {stdev_time:.2f}")
+    logger.info(f"  Mean:          {avg_time:.3f}")
+    logger.info(f"  Std Dev:       {stdev_time:.3f}")
     logger.info("")
-    logger.info(f"Throughput:      {throughput:.2f} MB/s")
+    logger.info(f"Throughput:      {throughput_mbs:.2f} MB/s ({throughput_gbs:.2f} GB/s)")
     logger.info("=" * 60)
 
     # Verify correctness
