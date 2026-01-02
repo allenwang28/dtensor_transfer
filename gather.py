@@ -5,11 +5,11 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-DTensor IPC Transfer Demo (Gather approach)
+DTensor Transfer Demo (Gather approach)
 
 Demonstrates how to:
 1. Create a tensor and shard it as DTensor A (Shard(0) - row-wise)
-2. Transfer data via CUDA IPC handles
+2. Transfer data via RemoteTensor handles (supports IPC and RDMA)
 3. Reconstruct and reshard as DTensor B (Shard(1) - column-wise)
 
 This "gather" approach:
@@ -22,16 +22,16 @@ Uses Monarch actors to model the two different DTensor configurations.
 
 import logging
 import os
-import time
-from dataclasses import dataclass
 from functools import partial
-from typing import Any, List, Tuple
+from typing import List, Tuple
 
 import torch
 from monarch.actor import Actor, current_rank, endpoint, this_host
 from monarch.spmd import setup_torch_elastic_env
 from torch.distributed._tensor import DTensor, Shard
 from torch.distributed.device_mesh import init_device_mesh
+
+from remote_tensor import RemoteTensor, Transport
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -123,34 +123,12 @@ def get_physical_gpu_id(logical_device: int = 0) -> int:
 
 
 # =============================================================================
-# Data Structures
-# =============================================================================
-
-
-@dataclass
-class CudaIPCHandle:
-    """Serializable CUDA IPC handle for cross-process tensor sharing."""
-
-    device: int
-    handle: Any  # cudaIpcMemHandle_t (bytes)
-    size_bytes: int
-    offset_bytes: int
-    ref_counter_handle: Any
-    ref_counter_offset: int
-    event_handle: Any
-    event_sync_required: bool
-    shape: Tuple[int, ...]
-    stride: Tuple[int, ...]
-    dtype: torch.dtype
-
-
-# =============================================================================
 # Actors
 # =============================================================================
 
 
 class Sender(Actor):
-    """Actor that creates a DTensor with Shard(0) and exposes IPC handles."""
+    """Actor that creates a DTensor with Shard(0) and exposes RemoteTensor handles."""
 
     def __init__(self, tensor_shape: Tuple[int, ...], dtype: torch.dtype):
         self.rank = current_rank().rank
@@ -203,45 +181,25 @@ class Sender(Actor):
         return local_shape
 
     @endpoint
-    def get_ipc_handle(self) -> CudaIPCHandle:
-        """Extract CUDA IPC handle from local tensor shard."""
+    def get_remote_tensor(self) -> RemoteTensor:
+        """Create a RemoteTensor handle for the local tensor shard."""
         local_tensor = self.dtensor.to_local()
 
-        if not local_tensor.is_contiguous():
-            local_tensor = local_tensor.contiguous()
+        physical_gpu = get_physical_gpu_id(self.rank)
 
-        storage = local_tensor.untyped_storage()
+        handle = RemoteTensor.from_tensor(
+            local_tensor,
+            owner=f"sender_{self.rank}",
+            enable_ipc=True,
+            enable_rdma=False,  # Set to True for cross-node
+        )
 
-        (
-            device,
-            handle,
-            size_bytes,
-            offset_bytes,
-            ref_counter_handle,
-            ref_counter_offset,
-            event_handle,
-            event_sync_required,
-        ) = storage._share_cuda_()
-
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        physical_gpu = get_physical_gpu_id(local_rank)
         logger.info(
-            f"[Sender {self.rank}] Extracted IPC handle for physical GPU {physical_gpu}"
+            f"[Sender {self.rank}] Created RemoteTensor for physical GPU {physical_gpu}, "
+            f"shape={handle.shape}"
         )
 
-        return CudaIPCHandle(
-            device=device,
-            handle=handle,
-            size_bytes=size_bytes,
-            offset_bytes=offset_bytes,
-            ref_counter_handle=ref_counter_handle,
-            ref_counter_offset=ref_counter_offset,
-            event_handle=event_handle,
-            event_sync_required=event_sync_required,
-            shape=tuple(local_tensor.shape),
-            stride=tuple(local_tensor.stride()),
-            dtype=local_tensor.dtype,
-        )
+        return handle
 
     @endpoint
     def destroy(self) -> None:
@@ -252,7 +210,7 @@ class Sender(Actor):
 
 
 class Receiver(Actor):
-    """Actor that receives IPC handles and creates DTensor with Shard(1)."""
+    """Actor that receives RemoteTensor handles and creates DTensor with Shard(1)."""
 
     def __init__(self, global_shape: Tuple[int, ...], dtype: torch.dtype):
         self.rank = current_rank().rank
@@ -260,8 +218,10 @@ class Receiver(Actor):
         self.dtype = dtype
         self.dtensor = None
         self.device_mesh = None
-        # Pre-opened IPC tensors for repeated transfers
-        self.ipc_shards: List[torch.Tensor] = []
+        # Pre-opened remote tensor handles
+        self.remote_shards: List[RemoteTensor] = []
+        # Local buffers for receiving data
+        self.local_buffers: List[torch.Tensor] = []
 
     @endpoint
     def init_and_create_dtensor(self) -> Tuple[int, ...]:
@@ -301,56 +261,41 @@ class Receiver(Actor):
         return local_shape
 
     @endpoint
-    def setup_ipc_handles(self, ipc_handles: List[CudaIPCHandle]) -> int:
+    def setup_remote_tensors(self, remote_tensors: List[RemoteTensor]) -> int:
         """
-        Open IPC handles once and store references for repeated transfers.
+        Store remote tensor handles and allocate local buffers for receiving.
         Returns the number of shards set up.
         """
-        self.ipc_shards.clear()
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        my_physical_gpu = get_physical_gpu_id(local_rank)
+        self.remote_shards = remote_tensors
+        self.local_buffers.clear()
 
-        for i, handle in enumerate(ipc_handles):
-            # Reconstruct storage from IPC handle
-            storage = torch.UntypedStorage._new_shared_cuda(
-                handle.device,
-                handle.handle,
-                handle.size_bytes,
-                handle.offset_bytes,
-                handle.ref_counter_handle,
-                handle.ref_counter_offset,
-                handle.event_handle,
-                handle.event_sync_required,
-            )
+        my_physical_gpu = get_physical_gpu_id(self.rank)
 
-            # Create tensor from storage
-            tensor = torch.empty(
-                handle.shape, dtype=handle.dtype, device=f"cuda:{handle.device}"
-            )
-            tensor.set_(
-                storage, storage_offset=0, size=handle.shape, stride=handle.stride
-            )
+        for i, rt in enumerate(remote_tensors):
+            # Allocate local buffer to receive into
+            buffer = torch.empty(rt.shape, dtype=rt.dtype, device="cuda")
+            self.local_buffers.append(buffer)
 
-            self.ipc_shards.append(tensor)
-
-            # Sender i maps to physical GPU i (for senders using GPUs 0..n_senders-1)
-            sender_physical_gpu = i
+            sender_physical_gpu = i  # Senders use GPUs 0..n_senders-1
             logger.info(
-                f"[Receiver {self.rank}] Set up IPC shard {i}: "
+                f"[Receiver {self.rank}] Set up RemoteTensor {i}: "
                 f"GPU {sender_physical_gpu} -> GPU {my_physical_gpu}, "
-                f"shape={handle.shape}"
+                f"shape={rt.shape}"
             )
 
-        return len(self.ipc_shards)
+        return len(self.remote_shards)
 
     @endpoint
-    def receive(self, n_streams: int = 1) -> float:
+    def receive(self, n_streams: int = 1, transport: str = "auto") -> float:
         """
         Gather all shards, concatenate, and reshard into DTensor.
         Returns elapsed time in milliseconds (CUDA event timing).
+
+        Args:
+            n_streams: Number of CUDA streams for parallel transfers
+            transport: "ipc", "rdma", or "auto"
         """
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        local_device = f"cuda:{local_rank}"
+        transport_enum = Transport(transport)
 
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
@@ -358,26 +303,24 @@ class Receiver(Actor):
         start_event.record()
 
         if n_streams <= 1:
-            # Sequential copy
-            shards = []
-            for tensor in self.ipc_shards:
-                shards.append(tensor.to(local_device))
+            # Sequential transfer
+            for rt, buf in zip(self.remote_shards, self.local_buffers):
+                rt.read_into(buf, transport=transport_enum)
         else:
-            # Parallel copy with multiple streams
+            # Parallel transfer with multiple streams
             streams = [torch.cuda.Stream() for _ in range(n_streams)]
-            shards = [None] * len(self.ipc_shards)
 
-            for i, tensor in enumerate(self.ipc_shards):
+            for i, (rt, buf) in enumerate(zip(self.remote_shards, self.local_buffers)):
                 stream = streams[i % n_streams]
                 with torch.cuda.stream(stream):
-                    shards[i] = tensor.to(local_device)
+                    rt.read_into(buf, transport=transport_enum)
 
             # Sync all streams
             for stream in streams:
                 stream.synchronize()
 
         # Concatenate all shards (Shard(0) means concat along dim 0)
-        full_tensor = torch.cat(shards, dim=0)
+        full_tensor = torch.cat(self.local_buffers, dim=0)
 
         # Reshard into our local DTensor with Shard(1)
         # This requires slicing out our column portion
@@ -421,10 +364,10 @@ class Receiver(Actor):
 
 def main():
     """
-    Main function demonstrating DTensor transfer via CUDA IPC (gather approach).
+    Main function demonstrating DTensor transfer via RemoteTensor (gather approach).
 
     1. Creates a tensor and shards it with Shard(0) across sender mesh
-    2. Extracts IPC handles from each sender rank
+    2. Extracts RemoteTensor handles from each sender rank
     3. Passes handles to receiver mesh, which gathers, concatenates, reshards with Shard(1)
     4. Benchmarks the transfer over multiple iterations
     """
@@ -435,17 +378,19 @@ def main():
     n_warmup = 2
     n_iterations = 10
     n_streams = 4  # Number of CUDA streams for parallel copies
+    transport = "auto"  # "ipc", "rdma", or "auto"
 
     sender_gpu_ids = list(range(n_senders))
     receiver_gpu_ids = list(range(n_senders, n_senders + n_receivers))
 
     logger.info("=" * 60)
-    logger.info("DTensor CUDA IPC Transfer Demo (Gather)")
+    logger.info("DTensor Transfer Demo (Gather) - Using RemoteTensor")
     logger.info("=" * 60)
     logger.info(f"Senders: {n_senders} (GPUs {sender_gpu_ids})")
     logger.info(f"Receivers: {n_receivers} (GPUs {receiver_gpu_ids})")
     logger.info(f"Tensor shape: {tensor_shape}")
     logger.info(f"CUDA streams: {n_streams}")
+    logger.info(f"Transport: {transport}")
     tensor_size_mb = tensor_shape[0] * tensor_shape[1] * 4 / 1024 / 1024
     logger.info(f"Tensor size: {tensor_size_mb:.2f} MB")
     logger.info("Sender sharding: Shard(0) - row-wise")
@@ -490,23 +435,23 @@ def main():
     for proc_info, shape in receiver_shapes:
         logger.info(f"  Receiver rank {proc_info.rank}: local shape {shape} (Shard(1))")
 
-    # Get IPC handles from all senders
-    logger.info("--- Extracting IPC handles ---")
-    ipc_results = senders.get_ipc_handle.call().get()
-    ipc_handles = [handle for _, handle in ipc_results]
-    logger.info(f"  Collected {len(ipc_handles)} IPC handles")
+    # Get RemoteTensor handles from all senders
+    logger.info("--- Extracting RemoteTensor handles ---")
+    rt_results = senders.get_remote_tensor.call().get()
+    remote_tensors = [handle for _, handle in rt_results]
+    logger.info(f"  Collected {len(remote_tensors)} RemoteTensor handles")
 
-    # Set up IPC handles once on all receivers
-    logger.info("--- Setting up IPC handles on receivers ---")
-    setup_results = receivers.setup_ipc_handles.call(ipc_handles).get()
+    # Set up remote tensors on all receivers
+    logger.info("--- Setting up RemoteTensors on receivers ---")
+    setup_results = receivers.setup_remote_tensors.call(remote_tensors).get()
     for proc_info, num_shards in setup_results:
-        logger.info(f"  Receiver {proc_info.rank}: set up {num_shards} IPC shards")
+        logger.info(f"  Receiver {proc_info.rank}: set up {num_shards} remote tensors")
 
     # Warmup iterations
     logger.info(f"--- Warmup ({n_warmup} iterations) ---")
     for i in range(n_warmup):
         receivers.clear_tensor.call().get()
-        results = receivers.receive.call(n_streams).get()
+        results = receivers.receive.call(n_streams, transport).get()
         cuda_times = [elapsed_ms for _, elapsed_ms in results]
         max_cuda_time = max(cuda_times)
         logger.info(f"  Warmup {i + 1}: {max_cuda_time:.3f} ms (CUDA timed)")
@@ -516,7 +461,7 @@ def main():
     times = []
     for i in range(n_iterations):
         receivers.clear_tensor.call().get()
-        results = receivers.receive.call(n_streams).get()
+        results = receivers.receive.call(n_streams, transport).get()
         cuda_times = [elapsed_ms for _, elapsed_ms in results]
         max_cuda_time = max(cuda_times)
         times.append(max_cuda_time)
@@ -542,6 +487,7 @@ def main():
     logger.info("BENCHMARK RESULTS (CUDA Event Timing)")
     logger.info("=" * 60)
     logger.info(f"Tensor size:     {tensor_size_mb:.2f} MB")
+    logger.info(f"Transport:       {transport}")
     logger.info(f"Iterations:      {n_iterations}")
     logger.info("")
     logger.info("All times (ms):")
@@ -603,7 +549,7 @@ def main():
     except Exception:
         pass
 
-    logger.info("SUCCESS: DTensor IPC transfer completed!")
+    logger.info("SUCCESS: DTensor transfer completed!")
 
 
 if __name__ == "__main__":
