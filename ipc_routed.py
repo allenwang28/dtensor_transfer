@@ -211,7 +211,19 @@ def set_cuda_device(gpu_ids: List[int]) -> None:
     """Bootstrap function to set CUDA_VISIBLE_DEVICES."""
     logging.basicConfig(level=logging.INFO)
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
-    logger.info(f"[Rank {current_rank().rank}] Set CUDA_VISIBLE_DEVICES={gpu_ids}")
+    # Store physical GPU IDs so actors can reference them later
+    os.environ["PHYSICAL_GPU_IDS"] = ",".join(str(g) for g in gpu_ids)
+    rank = current_rank().rank
+    physical_gpu = gpu_ids[rank] if rank < len(gpu_ids) else gpu_ids[0]
+    logger.info(f"[Rank {rank}] Set CUDA_VISIBLE_DEVICES={gpu_ids}, using physical GPU {physical_gpu}")
+
+
+def get_physical_gpu_id(logical_device: int = 0) -> int:
+    """Convert logical CUDA device index to physical GPU ID."""
+    physical_ids = os.environ.get("PHYSICAL_GPU_IDS", "0").split(",")
+    if logical_device < len(physical_ids):
+        return int(physical_ids[logical_device])
+    return logical_device
 
 
 # =============================================================================
@@ -432,6 +444,8 @@ class Receiver(Actor):
             Number of chunks set up.
         """
         self.ipc_chunks.clear()
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        my_physical_gpu = get_physical_gpu_id(local_rank)
 
         for sender_rank, handle, receiver_offset in chunk_handles:
             # Reconstruct the chunk tensor from IPC handle
@@ -462,8 +476,12 @@ class Receiver(Actor):
             # Store for repeated use
             self.ipc_chunks.append((chunk_tensor, receiver_slices))
 
+            # The handle.device is the sender's logical device (always 0 in their view)
+            # but we know sender_rank maps to physical GPU sender_rank (for senders 0,1 -> GPUs 0,1)
+            sender_physical_gpu = sender_rank  # Senders use GPUs 0..n_senders-1
             logger.info(
-                f"[Receiver {self.rank}] Set up IPC chunk from sender {sender_rank}: "
+                f"[Receiver {self.rank}] Set up IPC chunk: "
+                f"GPU {sender_physical_gpu} -> GPU {my_physical_gpu}, "
                 f"shape={handle.shape}, offset={receiver_offset}"
             )
 
