@@ -372,20 +372,42 @@ def main():
         logger.info(f"  Iteration {i + 1}: {elapsed * 1000:.2f} ms")
 
     # Print benchmark results
-    avg_time = sum(times) / len(times)
-    min_time = min(times)
-    max_time = max(times)
+    import statistics
+
+    times_ms = [t * 1000 for t in times]
+    avg_time = statistics.mean(times_ms)
+    min_time = min(times_ms)
+    max_time = max(times_ms)
+    median_time = statistics.median(times_ms)
+    stdev_time = statistics.stdev(times_ms) if len(times_ms) > 1 else 0
+    sorted_times = sorted(times_ms)
+    p25 = sorted_times[len(sorted_times) // 4]
+    p75 = sorted_times[(3 * len(sorted_times)) // 4]
+    p90 = sorted_times[int(len(sorted_times) * 0.9)]
     tensor_size_mb = tensor_shape[0] * tensor_shape[1] * 4 / 1024 / 1024
-    throughput = tensor_size_mb / avg_time
+    throughput = tensor_size_mb / (avg_time / 1000)
 
     logger.info("=" * 60)
     logger.info("BENCHMARK RESULTS")
     logger.info("=" * 60)
     logger.info(f"Tensor size:     {tensor_size_mb:.2f} MB")
     logger.info(f"Iterations:      {n_iterations}")
-    logger.info(f"Avg time:        {avg_time * 1000:.2f} ms")
-    logger.info(f"Min time:        {min_time * 1000:.2f} ms")
-    logger.info(f"Max time:        {max_time * 1000:.2f} ms")
+    logger.info("")
+    logger.info("All times (ms):")
+    for i, t in enumerate(times_ms):
+        logger.info(f"  [{i+1:2d}] {t:8.2f} ms")
+    logger.info("")
+    logger.info("Distribution (ms):")
+    logger.info(f"  Min:           {min_time:.2f}")
+    logger.info(f"  P25:           {p25:.2f}")
+    logger.info(f"  Median (P50):  {median_time:.2f}")
+    logger.info(f"  P75:           {p75:.2f}")
+    logger.info(f"  P90:           {p90:.2f}")
+    logger.info(f"  Max:           {max_time:.2f}")
+    logger.info("")
+    logger.info(f"  Mean:          {avg_time:.2f}")
+    logger.info(f"  Std Dev:       {stdev_time:.2f}")
+    logger.info("")
     logger.info(f"Throughput:      {throughput:.2f} MB/s")
     logger.info("=" * 60)
 
