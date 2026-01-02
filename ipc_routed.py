@@ -644,7 +644,7 @@ def main():
     # Configuration
     n_senders = 2
     n_receivers = 2
-    tensor_shape = (51200, 51200)  # 10 GB tensor (51200 * 51200 * 4 bytes)
+    tensor_shape = (114688, 114688)  # ~49 GB tensor (114688 * 114688 * 4 bytes)
     n_warmup = 2
     n_iterations = 10
     n_streams = 4  # Number of CUDA streams for parallel copies
