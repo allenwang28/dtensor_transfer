@@ -5,14 +5,18 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-DTensor IPC Routed Transfer Demo
+DTensor IPC Direct Transfer Demo
 
 Unlike ipc_gather.py which gathers ALL shards then reshards, this approach:
 1. Computes which sender shards overlap with which receiver shards
-2. Each receiver only reads the specific chunks it needs from sender shards
-3. Directly assembles the local shard without full tensor reconstruction
+2. Senders pre-slice their tensors into exactly the chunks receivers need
+3. IPC handles point to these pre-sliced chunks (not full shards)
+4. Receivers copy chunks directly without any slicing on their end
 
-This is more efficient for large tensors as it avoids redundant data transfer.
+This is more efficient because:
+- Only the exact data needed is transferred (no redundant data)
+- Receivers don't need to map entire sender shards into memory
+- No slicing overhead on the receiver side
 
 Inspired by PyTorch DCP's resharding algorithm using overlap detection.
 """
@@ -70,6 +74,7 @@ class TransferChunk:
     """Describes a single chunk transfer from sender to receiver."""
 
     sender_rank: int
+    receiver_rank: int  # Added: which receiver this chunk is for
     sender_offset: Tuple[int, ...]  # Offset within sender's local shard
     receiver_offset: Tuple[int, ...]  # Offset within receiver's local shard
     lengths: Tuple[int, ...]  # Size of chunk to transfer
@@ -120,6 +125,7 @@ def compute_overlap(
 
     return TransferChunk(
         sender_rank=sender.rank,
+        receiver_rank=receiver.rank,
         sender_offset=tuple(sender_offsets),
         receiver_offset=tuple(receiver_offsets),
         lengths=tuple(lengths),
@@ -142,6 +148,26 @@ def compute_transfer_plan(
             chunk = compute_overlap(send_shard, recv_shard)
             if chunk is not None:
                 plan[recv_shard.rank].append(chunk)
+
+    return plan
+
+
+def compute_sender_plan(
+    sender_shards: List[ShardMetadata],
+    receiver_shards: List[ShardMetadata],
+) -> dict[int, List[TransferChunk]]:
+    """
+    Compute which chunks each sender needs to prepare.
+
+    Returns a dict mapping sender_rank -> list of TransferChunks.
+    """
+    plan: dict[int, List[TransferChunk]] = {s.rank: [] for s in sender_shards}
+
+    for recv_shard in receiver_shards:
+        for send_shard in sender_shards:
+            chunk = compute_overlap(send_shard, recv_shard)
+            if chunk is not None:
+                plan[send_shard.rank].append(chunk)
 
     return plan
 
@@ -201,6 +227,8 @@ class Sender(Actor):
         self.global_tensor = global_tensor
         self.dtensor = None
         self.device_mesh = None
+        # Store pre-sliced chunks to keep them alive for IPC
+        self.chunk_tensors: dict[int, torch.Tensor] = {}
 
     @endpoint
     def setup_and_create_dtensor(self) -> Tuple[int, ...]:
@@ -229,6 +257,76 @@ class Sender(Actor):
         logger.info(f"[Sender {self.rank}] Local shard shape: {local_shape}")
 
         return local_shape
+
+    @endpoint
+    def prepare_chunks(self, chunks: List[TransferChunk]) -> int:
+        """
+        Pre-slice the local tensor into chunks needed by receivers.
+        Returns the number of chunks prepared.
+        """
+        local_tensor = self.dtensor.to_local()
+        self.chunk_tensors.clear()
+
+        for chunk in chunks:
+            # Build slice for this chunk
+            slices = tuple(
+                slice(off, off + length)
+                for off, length in zip(chunk.sender_offset, chunk.lengths)
+            )
+            # Slice and make contiguous (required for IPC)
+            chunk_tensor = local_tensor[slices].contiguous()
+            # Store by receiver_rank so we can retrieve it later
+            self.chunk_tensors[chunk.receiver_rank] = chunk_tensor
+
+            logger.info(
+                f"[Sender {self.rank}] Prepared chunk for receiver {chunk.receiver_rank}: "
+                f"shape={chunk_tensor.shape}"
+            )
+
+        return len(self.chunk_tensors)
+
+    @endpoint
+    def get_chunk_ipc_handles(self) -> dict[int, CudaIPCHandle]:
+        """
+        Get IPC handles for all prepared chunks.
+        Returns a dict mapping receiver_rank -> CudaIPCHandle.
+        """
+        handles: dict[int, CudaIPCHandle] = {}
+
+        for receiver_rank, chunk_tensor in self.chunk_tensors.items():
+            storage = chunk_tensor.untyped_storage()
+
+            (
+                device,
+                handle,
+                size_bytes,
+                offset_bytes,
+                ref_counter_handle,
+                ref_counter_offset,
+                event_handle,
+                event_sync_required,
+            ) = storage._share_cuda_()
+
+            handles[receiver_rank] = CudaIPCHandle(
+                device=device,
+                handle=handle,
+                size_bytes=size_bytes,
+                offset_bytes=offset_bytes,
+                ref_counter_handle=ref_counter_handle,
+                ref_counter_offset=ref_counter_offset,
+                event_handle=event_handle,
+                event_sync_required=event_sync_required,
+                shape=tuple(chunk_tensor.shape),
+                stride=tuple(chunk_tensor.stride()),
+                dtype=chunk_tensor.dtype,
+            )
+
+            logger.info(
+                f"[Sender {self.rank}] Created IPC handle for receiver {receiver_rank}: "
+                f"shape={chunk_tensor.shape}, size_bytes={size_bytes}"
+            )
+
+        return handles
 
     @endpoint
     def get_ipc_handle(self) -> CudaIPCHandle:
@@ -276,18 +374,20 @@ class Sender(Actor):
 
 
 class Receiver(Actor):
-    """Actor that receives specific chunks via routed transfer."""
+    """Actor that receives specific chunks via direct transfer into a pre-allocated DTensor."""
 
     def __init__(self, global_shape: Tuple[int, ...], dtype: torch.dtype):
         self.rank = current_rank().rank
         self.global_shape = global_shape
         self.dtype = dtype
-        self.local_tensor = None
+        self.dtensor = None
         self.device_mesh = None
+        # Pre-opened IPC tensors: list of (chunk_tensor, receiver_slices)
+        self.ipc_chunks: List[Tuple[torch.Tensor, Tuple[slice, ...]]] = []
 
     @endpoint
-    def init_process_group(self) -> None:
-        """Initialize the process group for this receiver."""
+    def init_and_create_dtensor(self) -> Tuple[int, ...]:
+        """Initialize process group and create DTensor with Shard(1)."""
         logger.info(f"[Receiver {self.rank}] Initializing process group...")
         torch.distributed.init_process_group(backend="nccl")
 
@@ -299,45 +399,42 @@ class Receiver(Actor):
         )
         self.device_mesh = init_device_mesh("cuda", mesh_shape)
 
-    @endpoint
-    def receive_routed(
-        self,
-        ipc_handles: List[CudaIPCHandle],
-        transfer_chunks: List[TransferChunk],
-        local_shape: Tuple[int, ...],
-    ) -> Tuple[int, ...]:
-        """
-        Receive only the specific chunks needed for this receiver's shard.
-
-        Instead of gathering all data and resharding, we:
-        1. Allocate our local shard tensor
-        2. For each TransferChunk, copy only the needed region from the sender
-        """
+        # Create a zero tensor and distribute with Shard(1)
+        # This allocates the local shard that we'll write into
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        local_device = f"cuda:{local_rank}"
+        zero_tensor = torch.zeros(
+            self.global_shape, dtype=self.dtype, device=f"cuda:{local_rank}"
+        )
 
         logger.info(
-            f"[Receiver {self.rank}] Receiving {len(transfer_chunks)} chunks "
-            f"into local tensor of shape {local_shape}"
+            f"[Receiver {self.rank}] Creating DTensor with Shard(1), "
+            f"global shape: {self.global_shape}"
         )
+        self.dtensor = distribute_tensor(zero_tensor, self.device_mesh, [Shard(1)])
 
-        # Allocate local tensor for this receiver's shard
-        self.local_tensor = torch.zeros(
-            local_shape, dtype=self.dtype, device=local_device
-        )
+        local_shape = tuple(self.dtensor.to_local().shape)
+        logger.info(f"[Receiver {self.rank}] Local shard shape: {local_shape}")
 
-        # Process each transfer chunk
-        for chunk in transfer_chunks:
-            logger.info(
-                f"[Receiver {self.rank}]   Chunk from sender {chunk.sender_rank}: "
-                f"sender_offset={chunk.sender_offset}, "
-                f"receiver_offset={chunk.receiver_offset}, "
-                f"lengths={chunk.lengths}"
-            )
+        return local_shape
 
-            handle = ipc_handles[chunk.sender_rank]
+    @endpoint
+    def setup_ipc_handles(
+        self,
+        chunk_handles: List[Tuple[int, CudaIPCHandle, Tuple[int, ...]]],
+    ) -> int:
+        """
+        Open IPC handles once and store references for repeated transfers.
 
-            # Reconstruct sender's tensor from IPC handle
+        Args:
+            chunk_handles: List of (sender_rank, ipc_handle, receiver_offset) tuples.
+
+        Returns:
+            Number of chunks set up.
+        """
+        self.ipc_chunks.clear()
+
+        for sender_rank, handle, receiver_offset in chunk_handles:
+            # Reconstruct the chunk tensor from IPC handle
             storage = torch.UntypedStorage._new_shared_cuda(
                 handle.device,
                 handle.handle,
@@ -349,40 +446,49 @@ class Receiver(Actor):
                 handle.event_sync_required,
             )
 
-            sender_tensor = torch.empty(
+            chunk_tensor = torch.empty(
                 handle.shape, dtype=handle.dtype, device=f"cuda:{handle.device}"
             )
-            sender_tensor.set_(
+            chunk_tensor.set_(
                 storage, storage_offset=0, size=handle.shape, stride=handle.stride
             )
 
-            # Extract the specific chunk from sender
-            # Build slice for sender's local coordinates
-            sender_slices = tuple(
-                slice(off, off + length)
-                for off, length in zip(chunk.sender_offset, chunk.lengths)
-            )
-            sender_chunk = sender_tensor[sender_slices]
-
-            # Copy to local device if needed
-            sender_chunk = sender_chunk.to(local_device)
-
             # Build slice for receiver's local coordinates
             receiver_slices = tuple(
-                slice(off, off + length)
-                for off, length in zip(chunk.receiver_offset, chunk.lengths)
+                slice(off, off + sz)
+                for off, sz in zip(receiver_offset, handle.shape)
             )
 
-            # Copy chunk to the correct position in local tensor
-            self.local_tensor[receiver_slices] = sender_chunk
+            # Store for repeated use
+            self.ipc_chunks.append((chunk_tensor, receiver_slices))
 
-        logger.info(f"[Receiver {self.rank}] Routed transfer complete")
-        return tuple(self.local_tensor.shape)
+            logger.info(
+                f"[Receiver {self.rank}] Set up IPC chunk from sender {sender_rank}: "
+                f"shape={handle.shape}, offset={receiver_offset}"
+            )
+
+        return len(self.ipc_chunks)
+
+    @endpoint
+    def receive(self) -> None:
+        """
+        Copy data from pre-opened IPC tensors into DTensor's local shard.
+        This is the hot path - just copy_ calls.
+        """
+        local_tensor = self.dtensor.to_local()
+
+        for chunk_tensor, receiver_slices in self.ipc_chunks:
+            local_tensor[receiver_slices].copy_(chunk_tensor)
+
+    @endpoint
+    def clear_tensor(self) -> None:
+        """Zero out the local tensor for the next benchmark run."""
+        self.dtensor.to_local().zero_()
 
     @endpoint
     def get_local_tensor(self) -> torch.Tensor:
         """Return the local tensor shard for verification."""
-        return self.local_tensor.cpu()
+        return self.dtensor.to_local().cpu()
 
     @endpoint
     def destroy(self) -> None:
@@ -401,9 +507,10 @@ def main():
     """
     Main function demonstrating routed DTensor transfer via CUDA IPC.
 
-    Key difference from ipc_gather.py:
-    - Computes overlap between Shard(0) and Shard(1) layouts
-    - Each receiver only reads the chunks it needs (no full gather)
+    This version uses "direct transfer" where:
+    - Senders pre-slice their tensors into exactly the chunks receivers need
+    - IPC handles point to these pre-sliced chunks (not full shards)
+    - Receivers just copy the chunks directly without any slicing
     """
     # Configuration
     n_senders = 2
@@ -419,7 +526,7 @@ def main():
     receiver_gpu_ids = list(range(n_senders, n_senders + n_receivers))
 
     logger.info("=" * 60)
-    logger.info("DTensor CUDA IPC Routed Transfer Demo")
+    logger.info("DTensor CUDA IPC Direct Transfer Demo")
     logger.info("=" * 60)
     logger.info(f"Senders: {n_senders} (GPUs {sender_gpu_ids})")
     logger.info(f"Receivers: {n_receivers} (GPUs {receiver_gpu_ids})")
@@ -447,18 +554,26 @@ def main():
     for r in receiver_shards:
         logger.info(f"  Rank {r.rank}: offsets={r.offsets}, sizes={r.sizes}")
 
-    # Compute transfer plan
-    transfer_plan = compute_transfer_plan(sender_shards, receiver_shards)
+    # Compute transfer plans (both sender-side and receiver-side views)
+    receiver_plan = compute_transfer_plan(sender_shards, receiver_shards)
+    sender_plan = compute_sender_plan(sender_shards, receiver_shards)
 
-    logger.info("--- Transfer Plan ---")
-    for recv_rank, chunks in transfer_plan.items():
+    logger.info("--- Sender Plan (chunks to prepare) ---")
+    for send_rank, chunks in sender_plan.items():
+        logger.info(f"  Sender {send_rank} prepares {len(chunks)} chunks:")
+        for chunk in chunks:
+            logger.info(
+                f"    For receiver {chunk.receiver_rank}: "
+                f"offset={chunk.sender_offset}, len={chunk.lengths}"
+            )
+
+    logger.info("--- Receiver Plan (chunks to receive) ---")
+    for recv_rank, chunks in receiver_plan.items():
         logger.info(f"  Receiver {recv_rank} needs {len(chunks)} chunks:")
         for chunk in chunks:
             logger.info(
                 f"    From sender {chunk.sender_rank}: "
-                f"sender_off={chunk.sender_offset}, "
-                f"recv_off={chunk.receiver_offset}, "
-                f"len={chunk.lengths}"
+                f"recv_off={chunk.receiver_offset}, len={chunk.lengths}"
             )
 
     # Create original tensor
@@ -485,10 +600,35 @@ def main():
     for proc_info, shape in sender_shapes:
         logger.info(f"  Sender rank {proc_info.rank}: local shape {shape}")
 
-    logger.info("--- Extracting IPC handles ---")
-    ipc_results = senders.get_ipc_handle.call().get()
-    ipc_handles = [handle for _, handle in ipc_results]
-    logger.info(f"  Collected {len(ipc_handles)} IPC handles")
+    # Have each sender prepare its chunks
+    logger.info("--- Senders preparing chunks ---")
+    for send_rank in range(n_senders):
+        chunks = sender_plan[send_rank]
+        senders.slice(gpu=send_rank).prepare_chunks.call(chunks).get()
+
+    # Get chunk IPC handles from all senders
+    logger.info("--- Extracting chunk IPC handles ---")
+    # Result: list of (proc_info, dict[receiver_rank -> CudaIPCHandle])
+    chunk_handle_results = senders.get_chunk_ipc_handles.call().get()
+
+    # Reorganize: receiver_rank -> list of (sender_rank, handle, receiver_offset)
+    receiver_chunk_handles: dict[int, List[Tuple[int, CudaIPCHandle, Tuple[int, ...]]]] = {
+        r: [] for r in range(n_receivers)
+    }
+
+    for proc_info, handles_dict in chunk_handle_results:
+        sender_rank = proc_info.rank
+        for receiver_rank, handle in handles_dict.items():
+            # Find the corresponding chunk to get receiver_offset
+            for chunk in sender_plan[sender_rank]:
+                if chunk.receiver_rank == receiver_rank:
+                    receiver_chunk_handles[receiver_rank].append(
+                        (sender_rank, handle, chunk.receiver_offset)
+                    )
+                    break
+
+    for recv_rank, handles in receiver_chunk_handles.items():
+        logger.info(f"  Receiver {recv_rank} will receive {len(handles)} chunk handles")
 
     # Spawn receivers
     receiver_procs = host.spawn_procs(
@@ -502,22 +642,30 @@ def main():
         "receivers", Receiver, tensor_shape, original.dtype
     )
 
-    receivers.init_process_group.call().get()
+    # Initialize and create DTensor with Shard(1) upfront
+    logger.info("--- Creating receiver DTensors with Shard(1) ---")
+    receiver_shapes = receivers.init_and_create_dtensor.call().get()
+    for proc_info, shape in receiver_shapes:
+        logger.info(f"  Receiver rank {proc_info.rank}: local shape {shape}")
+
+    # Set up IPC handles once (open handles and store references)
+    logger.info("--- Setting up IPC handles on receivers ---")
+    for recv_rank in range(n_receivers):
+        chunk_handles = receiver_chunk_handles[recv_rank]
+        results = receivers.slice(gpu=recv_rank).setup_ipc_handles.call(chunk_handles).get()
+        for proc_info, num_chunks in results:
+            logger.info(f"  Receiver {proc_info.rank}: set up {num_chunks} IPC chunks")
 
     # Warmup iterations
     logger.info(f"--- Warmup ({n_warmup} iterations) ---")
     for i in range(n_warmup):
+        # Clear tensors before transfer
+        receivers.clear_tensor.call().get()
+
         start_time = time.perf_counter()
 
-        # Each receiver gets its specific chunks
-        # For simplicity, we call each receiver with its plan
-        # In practice, you'd want to batch this
-        for recv_rank in range(n_receivers):
-            recv_chunks = transfer_plan[recv_rank]
-            local_shape = receiver_shards[recv_rank].sizes
-            receivers.slice(gpu=recv_rank).receive_routed.call(
-                ipc_handles, recv_chunks, local_shape
-            ).get()
+        # Only time the actual transfer - now just copy_ calls
+        receivers.receive.call().get()
 
         elapsed = time.perf_counter() - start_time
         logger.info(f"  Warmup {i + 1}: {elapsed * 1000:.2f} ms")
@@ -526,14 +674,13 @@ def main():
     logger.info(f"--- Benchmark ({n_iterations} iterations) ---")
     times = []
     for i in range(n_iterations):
+        # Clear tensors before transfer
+        receivers.clear_tensor.call().get()
+
         start_time = time.perf_counter()
 
-        for recv_rank in range(n_receivers):
-            recv_chunks = transfer_plan[recv_rank]
-            local_shape = receiver_shards[recv_rank].sizes
-            receivers.slice(gpu=recv_rank).receive_routed.call(
-                ipc_handles, recv_chunks, local_shape
-            ).get()
+        # Only time the actual transfer - now just copy_ calls
+        receivers.receive.call().get()
 
         elapsed = time.perf_counter() - start_time
         times.append(elapsed)
@@ -610,7 +757,7 @@ def main():
     except Exception:
         pass
 
-    logger.info("SUCCESS: DTensor IPC routed transfer completed!")
+    logger.info("SUCCESS: DTensor IPC direct transfer completed!")
 
 
 if __name__ == "__main__":
