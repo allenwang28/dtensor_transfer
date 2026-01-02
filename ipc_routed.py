@@ -18,7 +18,7 @@ This is more efficient because:
 - Receivers don't need to map entire sender shards into memory
 - No slicing overhead on the receiver side
 
-Inspired by PyTorch DCP's resharding algorithm using overlap detection.
+Re-uses logic from PyTorch DCP's resharding algorithm for overlap detection.
 """
 
 import logging
@@ -31,7 +31,12 @@ from typing import Any, List, Tuple
 import torch
 from monarch.actor import Actor, current_rank, endpoint, this_host
 from monarch.spmd import setup_torch_elastic_env
-from torch.distributed._tensor import distribute_tensor, Shard
+from torch.distributed._tensor import DTensor, Shard
+from torch.distributed.checkpoint.metadata import ChunkStorageMetadata
+from torch.distributed.checkpoint.resharding import (
+    _check_shard_metadata_pair_overlap,
+    _shards_get_overlap_region_wrt_saved_tensor,
+)
 from torch.distributed.device_mesh import init_device_mesh
 
 logging.basicConfig(level=logging.INFO)
@@ -61,12 +66,11 @@ class CudaIPCHandle:
 
 
 @dataclass
-class ShardMetadata:
-    """Describes a shard's position in the global tensor."""
+class RankedChunk:
+    """Wraps ChunkStorageMetadata with rank information."""
 
     rank: int  # Which rank owns this shard
-    offsets: Tuple[int, ...]  # Global offset (e.g., (512, 0) for row 512)
-    sizes: Tuple[int, ...]  # Size of this shard (e.g., (512, 1024))
+    chunk: ChunkStorageMetadata  # DCP's chunk metadata (offsets, sizes)
 
 
 @dataclass
@@ -81,60 +85,42 @@ class TransferChunk:
 
 
 # =============================================================================
-# Overlap Detection Algorithm (inspired by DCP)
+# Overlap Detection (using DCP utilities)
 # =============================================================================
 
 
-def compute_overlap(
-    sender: ShardMetadata, receiver: ShardMetadata
-) -> TransferChunk | None:
+def compute_overlap(sender: RankedChunk, receiver: RankedChunk) -> TransferChunk | None:
     """
-    Compute the overlap between a sender shard and receiver shard.
+    Compute the overlap between a sender shard and receiver shard using DCP.
 
     Returns a TransferChunk if there's overlap, None otherwise.
     """
-    ndim = len(sender.offsets)
-    assert ndim == len(receiver.offsets) == len(sender.sizes) == len(receiver.sizes)
+    # Use DCP's overlap check
+    if not _check_shard_metadata_pair_overlap(sender.chunk, receiver.chunk):
+        return None
 
-    # Compute overlap in each dimension
-    sender_offsets = []
-    receiver_offsets = []
-    lengths = []
+    # Get overlap region: list of (dim, sender_offset, receiver_offset, length)
+    overlap_info = _shards_get_overlap_region_wrt_saved_tensor(
+        sender.chunk, receiver.chunk
+    )
 
-    for dim in range(ndim):
-        # Sender's range in global coordinates
-        s_start = sender.offsets[dim]
-        s_end = s_start + sender.sizes[dim]
-
-        # Receiver's range in global coordinates
-        r_start = receiver.offsets[dim]
-        r_end = r_start + receiver.sizes[dim]
-
-        # Compute overlap
-        overlap_start = max(s_start, r_start)
-        overlap_end = min(s_end, r_end)
-
-        if overlap_start >= overlap_end:
-            # No overlap in this dimension
-            return None
-
-        # Offsets relative to each shard's local coordinates
-        sender_offsets.append(overlap_start - s_start)
-        receiver_offsets.append(overlap_start - r_start)
-        lengths.append(overlap_end - overlap_start)
+    # Extract offsets and lengths from the overlap info
+    sender_offsets = tuple(info[1] for info in overlap_info)
+    receiver_offsets = tuple(info[2] for info in overlap_info)
+    lengths = tuple(info[3] for info in overlap_info)
 
     return TransferChunk(
         sender_rank=sender.rank,
         receiver_rank=receiver.rank,
-        sender_offset=tuple(sender_offsets),
-        receiver_offset=tuple(receiver_offsets),
-        lengths=tuple(lengths),
+        sender_offset=sender_offsets,
+        receiver_offset=receiver_offsets,
+        lengths=lengths,
     )
 
 
 def compute_transfer_plan(
-    sender_shards: List[ShardMetadata],
-    receiver_shards: List[ShardMetadata],
+    sender_shards: List[RankedChunk],
+    receiver_shards: List[RankedChunk],
 ) -> dict[int, List[TransferChunk]]:
     """
     Compute which sender shards overlap with which receiver shards.
@@ -153,8 +139,8 @@ def compute_transfer_plan(
 
 
 def compute_sender_plan(
-    sender_shards: List[ShardMetadata],
-    receiver_shards: List[ShardMetadata],
+    sender_shards: List[RankedChunk],
+    receiver_shards: List[RankedChunk],
 ) -> dict[int, List[TransferChunk]]:
     """
     Compute which chunks each sender needs to prepare.
@@ -176,9 +162,10 @@ def compute_shard_metadata(
     global_shape: Tuple[int, ...],
     num_ranks: int,
     shard_dim: int,
-) -> List[ShardMetadata]:
+) -> List[RankedChunk]:
     """
-    Compute ShardMetadata for each rank given a Shard(dim) placement.
+    Compute RankedChunk (using DCP's ChunkStorageMetadata) for each rank
+    given a Shard(dim) placement.
     """
     shards = []
     dim_size = global_shape[shard_dim]
@@ -195,11 +182,81 @@ def compute_shard_metadata(
         sizes = list(global_shape)
         sizes[shard_dim] = actual_size
 
-        shards.append(
-            ShardMetadata(rank=rank, offsets=tuple(offsets), sizes=tuple(sizes))
+        # Use DCP's ChunkStorageMetadata
+        chunk_meta = ChunkStorageMetadata(
+            offsets=torch.Size(offsets),
+            sizes=torch.Size(sizes),
         )
+        shards.append(RankedChunk(rank=rank, chunk=chunk_meta))
 
     return shards
+
+
+# =============================================================================
+# Tensor Creation (called locally by senders, and for verification)
+# =============================================================================
+
+
+def create_local_shard(
+    global_shape: Tuple[int, ...],
+    rank: int,
+    world_size: int,
+    shard_dim: int,
+    dtype: torch.dtype = torch.float32,
+    device: str = "cuda",
+) -> torch.Tensor:
+    """
+    Create only the local shard for this rank (avoids allocating full tensor).
+
+    For tensor[i,j] = i * num_cols + j, computes the values for this rank's shard.
+    """
+    num_cols = global_shape[1]
+    dim_size = global_shape[shard_dim]
+    chunk_size = (dim_size + world_size - 1) // world_size
+
+    start = rank * chunk_size
+    end = min(start + chunk_size, dim_size)
+
+    if shard_dim == 0:
+        # Sharding rows: local shard is rows [start:end], all columns
+        num_rows = end - start
+        # Values: (start + r) * num_cols + c for r in [0, num_rows), c in [0, num_cols)
+        row_indices = torch.arange(start, end, dtype=dtype, device=device).unsqueeze(1)
+        col_indices = torch.arange(0, num_cols, dtype=dtype, device=device).unsqueeze(0)
+        return row_indices * num_cols + col_indices
+    else:
+        # Sharding columns: local shard is all rows, columns [start:end]
+        num_rows = global_shape[0]
+        num_cols_local = end - start
+        row_indices = torch.arange(0, num_rows, dtype=dtype, device=device).unsqueeze(1)
+        col_indices = torch.arange(start, end, dtype=dtype, device=device).unsqueeze(0)
+        return row_indices * num_cols + col_indices
+
+
+def create_expected_slice(
+    global_shape: Tuple[int, ...],
+    offsets: Tuple[int, ...],
+    sizes: Tuple[int, ...],
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """
+    Create the expected values for a slice without allocating the full tensor.
+    For tensor[i,j] = i * num_cols + j, the slice starting at (row_off, col_off)
+    with size (num_rows, num_cols_slice) has values:
+      slice[r,c] = (row_off + r) * global_cols + (col_off + c)
+    """
+    num_cols = global_shape[1]
+    row_off, col_off = offsets
+    num_rows, num_cols_slice = sizes
+
+    # Create row indices and column indices
+    row_indices = torch.arange(row_off, row_off + num_rows, dtype=dtype).unsqueeze(1)
+    col_indices = torch.arange(
+        col_off, col_off + num_cols_slice, dtype=dtype
+    ).unsqueeze(0)
+
+    # Compute: (row_off + r) * num_cols + (col_off + c)
+    return row_indices * num_cols + col_indices
 
 
 # =============================================================================
@@ -215,7 +272,9 @@ def set_cuda_device(gpu_ids: List[int]) -> None:
     os.environ["PHYSICAL_GPU_IDS"] = ",".join(str(g) for g in gpu_ids)
     rank = current_rank().rank
     physical_gpu = gpu_ids[rank] if rank < len(gpu_ids) else gpu_ids[0]
-    logger.info(f"[Rank {rank}] Set CUDA_VISIBLE_DEVICES={gpu_ids}, using physical GPU {physical_gpu}")
+    logger.info(
+        f"[Rank {rank}] Set CUDA_VISIBLE_DEVICES={gpu_ids}, using physical GPU {physical_gpu}"
+    )
 
 
 def get_physical_gpu_id(logical_device: int = 0) -> int:
@@ -234,9 +293,10 @@ def get_physical_gpu_id(logical_device: int = 0) -> int:
 class Sender(Actor):
     """Actor that creates a DTensor with Shard(0) and exposes IPC handles."""
 
-    def __init__(self, global_tensor: torch.Tensor):
+    def __init__(self, tensor_shape: Tuple[int, ...], dtype: torch.dtype):
         self.rank = current_rank().rank
-        self.global_tensor = global_tensor
+        self.tensor_shape = tensor_shape
+        self.dtype = dtype
         self.dtensor = None
         self.device_mesh = None
         # Store pre-sliced chunks to keep them alive for IPC
@@ -251,19 +311,34 @@ class Sender(Actor):
 
         world_size = int(os.environ["WORLD_SIZE"])
         mesh_shape = (world_size,)
+        dist_rank = int(os.environ["RANK"])
 
         logger.info(
             f"[Sender {self.rank}] Creating device mesh with shape {mesh_shape}"
         )
         self.device_mesh = init_device_mesh("cuda", mesh_shape)
 
-        cuda_tensor = self.global_tensor.cuda()
+        # Create only local shard directly on GPU (avoids allocating full tensor)
         logger.info(
-            f"[Sender {self.rank}] Distributing tensor with Shard(0), "
-            f"global shape: {cuda_tensor.shape}"
+            f"[Sender {self.rank}] Creating local shard for global shape {self.tensor_shape}"
+        )
+        local_shard = create_local_shard(
+            self.tensor_shape,
+            rank=dist_rank,
+            world_size=world_size,
+            shard_dim=0,  # Shard(0)
+            dtype=self.dtype,
+            device="cuda",
         )
 
-        self.dtensor = distribute_tensor(cuda_tensor, self.device_mesh, [Shard(0)])
+        logger.info(
+            f"[Sender {self.rank}] Wrapping as DTensor with Shard(0), "
+            f"local shape: {local_shard.shape}"
+        )
+
+        self.dtensor = DTensor.from_local(
+            local_shard, self.device_mesh, [Shard(0)], run_check=False
+        )
 
         local_shape = tuple(self.dtensor.to_local().shape)
         logger.info(f"[Sender {self.rank}] Local shard shape: {local_shape}")
@@ -405,26 +480,31 @@ class Receiver(Actor):
 
         world_size = int(os.environ["WORLD_SIZE"])
         mesh_shape = (world_size,)
+        dist_rank = int(os.environ["RANK"])
 
         logger.info(
             f"[Receiver {self.rank}] Creating device mesh with shape {mesh_shape}"
         )
         self.device_mesh = init_device_mesh("cuda", mesh_shape)
 
-        # Create a zero tensor and distribute with Shard(1)
-        # This allocates the local shard that we'll write into
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        zero_tensor = torch.zeros(
-            self.global_shape, dtype=self.dtype, device=f"cuda:{local_rank}"
-        )
+        # Compute local shard size for Shard(1) and allocate only that
+        dim_size = self.global_shape[1]  # Sharding columns
+        chunk_size = (dim_size + world_size - 1) // world_size
+        start = dist_rank * chunk_size
+        end = min(start + chunk_size, dim_size)
+        local_cols = end - start
+        local_shape = (self.global_shape[0], local_cols)
 
         logger.info(
-            f"[Receiver {self.rank}] Creating DTensor with Shard(1), "
-            f"global shape: {self.global_shape}"
+            f"[Receiver {self.rank}] Creating local shard with shape {local_shape} "
+            f"(global: {self.global_shape})"
         )
-        self.dtensor = distribute_tensor(zero_tensor, self.device_mesh, [Shard(1)])
+        local_shard = torch.zeros(local_shape, dtype=self.dtype, device="cuda")
 
-        local_shape = tuple(self.dtensor.to_local().shape)
+        self.dtensor = DTensor.from_local(
+            local_shard, self.device_mesh, [Shard(1)], run_check=False
+        )
+
         logger.info(f"[Receiver {self.rank}] Local shard shape: {local_shape}")
 
         return local_shape
@@ -469,8 +549,7 @@ class Receiver(Actor):
 
             # Build slice for receiver's local coordinates
             receiver_slices = tuple(
-                slice(off, off + sz)
-                for off, sz in zip(receiver_offset, handle.shape)
+                slice(off, off + sz) for off, sz in zip(receiver_offset, handle.shape)
             )
 
             # Store for repeated use
@@ -565,10 +644,10 @@ def main():
     # Configuration
     n_senders = 2
     n_receivers = 2
-    tensor_shape = (16384, 16384)  # 1 GB tensor (16384 * 16384 * 4 bytes)
+    tensor_shape = (51200, 51200)  # 10 GB tensor (51200 * 51200 * 4 bytes)
     n_warmup = 2
     n_iterations = 10
-    n_streams = 2  # Number of CUDA streams for parallel copies
+    n_streams = 4  # Number of CUDA streams for parallel copies
 
     sender_shard_dim = 0  # Shard(0) - row-wise
     receiver_shard_dim = 1  # Shard(1) - column-wise
@@ -600,11 +679,15 @@ def main():
 
     logger.info("--- Sender Shard Layout ---")
     for s in sender_shards:
-        logger.info(f"  Rank {s.rank}: offsets={s.offsets}, sizes={s.sizes}")
+        logger.info(
+            f"  Rank {s.rank}: offsets={tuple(s.chunk.offsets)}, sizes={tuple(s.chunk.sizes)}"
+        )
 
     logger.info("--- Receiver Shard Layout ---")
     for r in receiver_shards:
-        logger.info(f"  Rank {r.rank}: offsets={r.offsets}, sizes={r.sizes}")
+        logger.info(
+            f"  Rank {r.rank}: offsets={tuple(r.chunk.offsets)}, sizes={tuple(r.chunk.sizes)}"
+        )
 
     # Compute transfer plans (both sender-side and receiver-side views)
     receiver_plan = compute_transfer_plan(sender_shards, receiver_shards)
@@ -628,12 +711,6 @@ def main():
                 f"recv_off={chunk.receiver_offset}, len={chunk.lengths}"
             )
 
-    # Create original tensor
-    original = (
-        torch.arange(tensor_shape[0] * tensor_shape[1]).reshape(tensor_shape).float()
-    )
-    logger.info(f"Created original tensor with shape {original.shape}")
-
     # Spawn both proc meshes in parallel
     logger.info("--- Spawning proc meshes ---")
     host = this_host()
@@ -652,11 +729,10 @@ def main():
     setup_torch_elastic_env(sender_procs)
     setup_torch_elastic_env(receiver_procs)
 
-    # Spawn actors
-    senders = sender_procs.spawn("senders", Sender, original)
-    receivers = receiver_procs.spawn(
-        "receivers", Receiver, tensor_shape, original.dtype
-    )
+    # Spawn actors (pass shape/dtype, tensors created locally on GPUs)
+    dtype = torch.float32
+    senders = sender_procs.spawn("senders", Sender, tensor_shape, dtype)
+    receivers = receiver_procs.spawn("receivers", Receiver, tensor_shape, dtype)
 
     # Initialize both sender and receiver DTensors in parallel
     logger.info("--- Creating DTensors ---")
@@ -683,9 +759,9 @@ def main():
     chunk_handle_results = senders.get_chunk_ipc_handles.call().get()
 
     # Reorganize: receiver_rank -> list of (sender_rank, handle, receiver_offset)
-    receiver_chunk_handles: dict[int, List[Tuple[int, CudaIPCHandle, Tuple[int, ...]]]] = {
-        r: [] for r in range(n_receivers)
-    }
+    receiver_chunk_handles: dict[
+        int, List[Tuple[int, CudaIPCHandle, Tuple[int, ...]]]
+    ] = {r: [] for r in range(n_receivers)}
 
     for proc_info, handles_dict in chunk_handle_results:
         sender_rank = proc_info.rank
@@ -705,7 +781,9 @@ def main():
     logger.info("--- Setting up IPC handles on receivers ---")
     for recv_rank in range(n_receivers):
         chunk_handles = receiver_chunk_handles[recv_rank]
-        results = receivers.slice(gpu=recv_rank).setup_ipc_handles.call(chunk_handles).get()
+        results = (
+            receivers.slice(gpu=recv_rank).setup_ipc_handles.call(chunk_handles).get()
+        )
         for proc_info, num_chunks in results:
             logger.info(f"  Receiver {proc_info.rank}: set up {num_chunks} IPC chunks")
 
@@ -775,7 +853,9 @@ def main():
     logger.info(f"  Mean:          {avg_time:.3f}")
     logger.info(f"  Std Dev:       {stdev_time:.3f}")
     logger.info("")
-    logger.info(f"Throughput:      {throughput_mbs:.2f} MB/s ({throughput_gbs:.2f} GB/s)")
+    logger.info(
+        f"Throughput:      {throughput_mbs:.2f} MB/s ({throughput_gbs:.2f} GB/s)"
+    )
     logger.info("=" * 60)
 
     # Verify correctness
@@ -785,13 +865,14 @@ def main():
         logger.info(
             f"  Receiver rank {proc_info.rank} local tensor shape: {tensor.shape}"
         )
-        # Verify content matches expected shard of original
+        # Verify content matches expected shard (computed without allocating full tensor)
         recv_shard = receiver_shards[proc_info.rank]
-        expected_slices = tuple(
-            slice(off, off + sz)
-            for off, sz in zip(recv_shard.offsets, recv_shard.sizes)
+        expected = create_expected_slice(
+            tensor_shape,
+            tuple(recv_shard.chunk.offsets),
+            tuple(recv_shard.chunk.sizes),
+            dtype,
         )
-        expected = original[expected_slices]
         if torch.equal(tensor, expected):
             logger.info(f"  Receiver rank {proc_info.rank}: VERIFIED ✓")
         else:

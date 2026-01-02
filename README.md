@@ -1,7 +1,6 @@
 # DTensor transfer
 
-Basic explorations of using DTensors for
-
+Basic explorations of transferring data from one DTensor to another across GPUs.
 
 Communication protocols:
 - IPC, i.e. CUDA<>CUDA transfers, restricted to the same node
