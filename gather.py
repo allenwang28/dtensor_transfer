@@ -23,7 +23,7 @@ Uses Monarch actors to model the two different DTensor configurations.
 import logging
 import os
 from functools import partial
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from monarch.actor import Actor, current_rank, endpoint, this_host
@@ -220,8 +220,10 @@ class Receiver(Actor):
         self.device_mesh = None
         # Pre-opened remote tensor handles
         self.remote_shards: List[RemoteTensor] = []
-        # Local buffers for receiving data
-        self.local_buffers: List[torch.Tensor] = []
+        # Single buffer for full gathered tensor
+        self.gather_buffer: Optional[torch.Tensor] = None
+        # Slices into gather_buffer for each sender shard
+        self.shard_slices: List[Tuple[slice, ...]] = []
 
     @endpoint
     def init_and_create_dtensor(self) -> Tuple[int, ...]:
@@ -263,24 +265,33 @@ class Receiver(Actor):
     @endpoint
     def setup_remote_tensors(self, remote_tensors: List[RemoteTensor]) -> int:
         """
-        Store remote tensor handles and allocate local buffers for receiving.
+        Store remote tensor handles and allocate gather buffer.
         Returns the number of shards set up.
         """
         self.remote_shards = remote_tensors
-        self.local_buffers.clear()
+        self.shard_slices.clear()
 
         my_physical_gpu = get_physical_gpu_id(self.rank)
 
+        # Allocate single contiguous buffer for full gathered tensor
+        self.gather_buffer = torch.empty(
+            self.global_shape, dtype=self.dtype, device="cuda"
+        )
+
+        # Compute slices for each sender shard (Shard(0) = row-wise)
+        n_senders = len(remote_tensors)
+        row_offset = 0
         for i, rt in enumerate(remote_tensors):
-            # Allocate local buffer to receive into
-            buffer = torch.empty(rt.shape, dtype=rt.dtype, device="cuda")
-            self.local_buffers.append(buffer)
+            shard_rows = rt.shape[0]
+            shard_slice = (slice(row_offset, row_offset + shard_rows), slice(None))
+            self.shard_slices.append(shard_slice)
+            row_offset += shard_rows
 
             sender_physical_gpu = i  # Senders use GPUs 0..n_senders-1
             logger.info(
                 f"[Receiver {self.rank}] Set up RemoteTensor {i}: "
                 f"GPU {sender_physical_gpu} -> GPU {my_physical_gpu}, "
-                f"shape={rt.shape}"
+                f"shape={rt.shape}, rows={shard_slice[0]}"
             )
 
         return len(self.remote_shards)
@@ -288,7 +299,7 @@ class Receiver(Actor):
     @endpoint
     def receive(self, n_streams: int = 1, transport: str = "auto") -> float:
         """
-        Gather all shards, concatenate, and reshard into DTensor.
+        Gather all shards into buffer, then copy column slice into DTensor.
         Returns elapsed time in milliseconds (CUDA event timing).
 
         Args:
@@ -303,27 +314,27 @@ class Receiver(Actor):
         start_event.record()
 
         if n_streams <= 1:
-            # Sequential transfer
-            for rt, buf in zip(self.remote_shards, self.local_buffers):
-                rt.read_into(buf, transport=transport_enum)
+            # Sequential transfer directly into gather buffer slices
+            for rt, shard_slice in zip(self.remote_shards, self.shard_slices):
+                rt.read_into(self.gather_buffer[shard_slice], transport=transport_enum)
         else:
             # Parallel transfer with multiple streams
             streams = [torch.cuda.Stream() for _ in range(n_streams)]
 
-            for i, (rt, buf) in enumerate(zip(self.remote_shards, self.local_buffers)):
+            for i, (rt, shard_slice) in enumerate(
+                zip(self.remote_shards, self.shard_slices)
+            ):
                 stream = streams[i % n_streams]
                 with torch.cuda.stream(stream):
-                    rt.read_into(buf, transport=transport_enum)
+                    rt.read_into(
+                        self.gather_buffer[shard_slice], transport=transport_enum
+                    )
 
             # Sync all streams
             for stream in streams:
                 stream.synchronize()
 
-        # Concatenate all shards (Shard(0) means concat along dim 0)
-        full_tensor = torch.cat(self.local_buffers, dim=0)
-
-        # Reshard into our local DTensor with Shard(1)
-        # This requires slicing out our column portion
+        # Copy our column slice into the DTensor's local storage
         world_size = int(os.environ["WORLD_SIZE"])
         dist_rank = int(os.environ["RANK"])
         dim_size = self.global_shape[1]
@@ -331,8 +342,7 @@ class Receiver(Actor):
         col_start = dist_rank * chunk_size
         col_end = min(col_start + chunk_size, dim_size)
 
-        # Copy our column slice into the DTensor's local storage
-        self.dtensor.to_local().copy_(full_tensor[:, col_start:col_end])
+        self.dtensor.to_local().copy_(self.gather_buffer[:, col_start:col_end])
 
         end_event.record()
         torch.cuda.synchronize()

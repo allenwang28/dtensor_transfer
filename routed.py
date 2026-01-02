@@ -357,8 +357,8 @@ class Receiver(Actor):
         self.dtype = dtype
         self.dtensor = None
         self.device_mesh = None
-        # List of (remote_tensor, local_buffer, receiver_slices)
-        self.chunk_info: List[Tuple[RemoteTensor, torch.Tensor, Tuple[slice, ...]]] = []
+        # List of (remote_tensor, receiver_slices)
+        self.chunk_info: List[Tuple[RemoteTensor, Tuple[slice, ...]]] = []
 
     @endpoint
     def init_and_create_dtensor(self) -> Tuple[int, ...]:
@@ -402,7 +402,7 @@ class Receiver(Actor):
         chunk_handles: List[Tuple[int, RemoteTensor, Tuple[int, ...]]],
     ) -> int:
         """
-        Store remote tensor handles and allocate local buffers.
+        Store remote tensor handles for direct IPC access.
 
         Args:
             chunk_handles: List of (sender_rank, remote_tensor, receiver_offset) tuples.
@@ -411,15 +411,12 @@ class Receiver(Actor):
         my_physical_gpu = get_physical_gpu_id(self.rank)
 
         for sender_rank, rt, receiver_offset in chunk_handles:
-            # Allocate local buffer
-            buffer = torch.empty(rt.shape, dtype=rt.dtype, device="cuda")
-
             # Build slice for receiver's local coordinates
             receiver_slices = tuple(
                 slice(off, off + sz) for off, sz in zip(receiver_offset, rt.shape)
             )
 
-            self.chunk_info.append((rt, buffer, receiver_slices))
+            self.chunk_info.append((rt, receiver_slices))
 
             sender_physical_gpu = sender_rank
             logger.info(
@@ -445,17 +442,15 @@ class Receiver(Actor):
         start_event.record()
 
         if n_streams <= 1:
-            for rt, buffer, receiver_slices in self.chunk_info:
-                rt.read_into(buffer, transport=transport_enum)
-                local_tensor[receiver_slices].copy_(buffer)
+            for rt, receiver_slices in self.chunk_info:
+                rt.read_into(local_tensor[receiver_slices], transport=transport_enum)
         else:
             streams = [torch.cuda.Stream() for _ in range(n_streams)]
 
-            for i, (rt, buffer, receiver_slices) in enumerate(self.chunk_info):
+            for i, (rt, receiver_slices) in enumerate(self.chunk_info):
                 stream = streams[i % n_streams]
                 with torch.cuda.stream(stream):
-                    rt.read_into(buffer, transport=transport_enum)
-                    local_tensor[receiver_slices].copy_(buffer)
+                    rt.read_into(local_tensor[receiver_slices], transport=transport_enum)
 
             for stream in streams:
                 stream.synchronize()

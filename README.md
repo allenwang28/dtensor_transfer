@@ -8,24 +8,24 @@ When working with distributed tensors (DTensors), a common operation is **reshar
 
 ## Approaches
 
-### Gather (`ipc_gather.py`)
+### Gather (`gather.py`)
 
-Each receiver gathers **all** sender shards, concatenates them into the full tensor, then extracts its portion:
+Each receiver gathers **all** sender shards into a buffer, then extracts its column portion:
 
 ```
 Sender 0 (rows 0-511)    ──┐
-                           ├──▶ Receiver 0: gather all → concat → slice cols 0-511
+                           ├──▶ Receiver 0: gather all → slice cols 0-511
 Sender 1 (rows 512-1023) ──┘
 
 Sender 0 (rows 0-511)    ──┐
-                           ├──▶ Receiver 1: gather all → concat → slice cols 512-1023
+                           ├──▶ Receiver 1: gather all → slice cols 512-1023
 Sender 1 (rows 512-1023) ──┘
 ```
 
 **Pros**: Simple implementation
 **Cons**: Each receiver transfers the entire tensor, even though it only needs half
 
-### Routed / Direct (`ipc_routed.py`)
+### Routed / Direct (`routed.py`)
 
 Senders pre-slice their tensors into exactly the chunks each receiver needs. Only the necessary data is transferred:
 
@@ -42,23 +42,51 @@ Sender 1 (rows 512-1023) ──▶ chunk [512:1024, 0:512]   ──▶ Receiver 
 
 ## Implementation
 
-### CUDA IPC Handles
+### RemoteTensor (`remote_tensor.py`)
 
-Both approaches use CUDA IPC for zero-copy GPU-to-GPU memory transfer:
+The `RemoteTensor` class provides a unified abstraction for cross-process tensor access, supporting both **CUDA IPC** (same-node) and **RDMA** (cross-node) transports:
 
-1. **Sender** extracts an IPC handle from its tensor's CUDA storage via `storage._share_cuda_()`
-2. **Handle** is serialized and sent to receivers (small metadata, not the tensor data)
-3. **Receiver** reconstructs a tensor view via `torch.UntypedStorage._new_shared_cuda()`
-4. **Copy** transfers data directly between GPU memories over NVLink
+```python
+from remote_tensor import RemoteTensor, Transport
+
+# Sender: create a handle from a local tensor
+handle = RemoteTensor.from_tensor(
+    tensor,
+    owner="sender_0",
+    enable_ipc=True,   # Same-node via CUDA IPC
+    enable_rdma=False, # Cross-node via RDMA
+)
+
+# ... handle is serialized and sent to receiver via actor message ...
+
+# Receiver: copy data into local tensor
+handle.read_into(local_tensor, transport=Transport.AUTO)
+
+# Or write to the remote tensor
+handle.write_from(local_tensor, transport=Transport.IPC)
+```
+
+**Key features:**
+- **Transport selection at call time**: Choose `Transport.IPC`, `Transport.RDMA`, or `Transport.AUTO` (prefers IPC)
+- **Lazy handle opening**: IPC handles are opened once and cached for repeated transfers
+- **Serializable**: Handles can be passed between processes via Monarch actor messages
+- **Unified API**: Same `read_into()`/`write_from()` interface for both transports
+
+**Transport comparison:**
+
+| Transport | Use Case | Mechanism |
+|-----------|----------|-----------|
+| IPC | Same-node GPU transfers | `storage._share_cuda_()` / `UntypedStorage._new_shared_cuda()` |
+| RDMA | Cross-node transfers | Monarch `RDMABuffer` with `read_into()` / `write_from()` |
 
 ### Actor-Based Architecture
 
 The implementation uses [Monarch](https://github.com/pytorch-labs/monarch) actors for distributed coordination:
 
-1. **Sender actors** initialize their DTensor shards and extract IPC handles
+1. **Sender actors** initialize their DTensor shards and create RemoteTensor handles
 2. **One-way message passing** sends handles from senders to receivers (setup phase)
-3. **Receivers open handles once** and store references for repeated transfers
-4. **Hot path** (`receive()`) only performs the actual `copy_()` operations
+3. **Receivers store handles** and call `read_into()` for repeated transfers
+4. **Hot path** (`receive()`) only performs the actual data transfers
 
 This separation of setup vs. transfer minimizes per-iteration overhead.
 
@@ -68,9 +96,9 @@ To maximize NVLink utilization, copies are parallelized across multiple CUDA str
 
 ```python
 streams = [torch.cuda.Stream() for _ in range(n_streams)]
-for i, chunk in enumerate(chunks):
+for i, (rt, slices) in enumerate(chunk_info):
     with torch.cuda.stream(streams[i % n_streams]):
-        dst[slices].copy_(chunk)
+        rt.read_into(local_tensor[slices], transport=Transport.AUTO)
 ```
 
 ### Overlap Detection (DCP Concepts)
@@ -105,19 +133,19 @@ from torch.distributed.checkpoint.resharding import (
 | Std dev | 0.4 ms |
 | **Throughput** | **119.9 GB/s** |
 
-### Routed Approach (50 GB tensor)
+### Routed Approach (10 GB tensor)
 
 | Metric | Value |
 |--------|-------|
-| Tensor size | 50,176 MB |
-| Mean time | 164.2 ms |
-| Std dev | 0.2 ms |
-| **Throughput** | **298.4 GB/s** |
+| Tensor size | 10,000 MB |
+| Mean time | 35.4 ms |
+| Std dev | 0.1 ms |
+| **Throughput** | **~280 GB/s** |
 
 ### Notes
 
 - Theoretical NVLink bandwidth: **450 GB/s** unidirectional per GPU pair
-- Current utilization: ~66% of theoretical peak
+- Current utilization: ~60-65% of theoretical peak
 - The gap is likely due to strided memory access patterns (column slicing) rather than contiguous transfers
 
 ## Usage
@@ -132,10 +160,10 @@ uv pip install torchmonarch==0.2.0
 
 ```bash
 # Gather approach
-python ipc_gather.py
+python gather.py
 
 # Routed/direct approach
-python ipc_routed.py
+python routed.py
 ```
 
 ### Configuration
@@ -147,4 +175,5 @@ n_senders = 2
 n_receivers = 2
 tensor_shape = (51200, 51200)  # 10 GB
 n_streams = 4
+transport = "auto"  # "ipc", "rdma", or "auto"
 ```
