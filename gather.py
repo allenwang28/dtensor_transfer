@@ -20,18 +20,22 @@ This "gather" approach:
 Uses Monarch actors to model the two different DTensor configurations.
 """
 
+import argparse
 import logging
 import os
 from functools import partial
 from typing import List, Optional, Tuple
 
+# Enable expandable segments for better memory management
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+
 import torch
 from monarch.actor import Actor, current_rank, endpoint, this_host
 from monarch.spmd import setup_torch_elastic_env
-from torch.distributed._tensor import DTensor, Shard
-from torch.distributed.device_mesh import init_device_mesh
 
 from remote_tensor import RemoteTensor, Transport
+from torch.distributed._tensor import DTensor, Shard
+from torch.distributed.device_mesh import init_device_mesh
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -104,6 +108,7 @@ def create_expected_slice(
 def set_cuda_device(gpu_ids: List[int]) -> None:
     """Bootstrap function to set CUDA_VISIBLE_DEVICES based on rank."""
     logging.basicConfig(level=logging.INFO)
+    os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
     # Store physical GPU IDs so actors can reference them later
     os.environ["PHYSICAL_GPU_IDS"] = ",".join(str(g) for g in gpu_ids)
@@ -191,7 +196,7 @@ class Sender(Actor):
             local_tensor,
             owner=f"sender_{self.rank}",
             enable_ipc=True,
-            enable_rdma=False,  # Set to True for cross-node
+            enable_rdma=True,
         )
 
         logger.info(
@@ -381,6 +386,16 @@ def main():
     3. Passes handles to receiver mesh, which gathers, concatenates, reshards with Shard(1)
     4. Benchmarks the transfer over multiple iterations
     """
+    parser = argparse.ArgumentParser(description="DTensor Transfer Demo (Gather)")
+    parser.add_argument(
+        "--transport",
+        type=str,
+        choices=["ipc", "rdma", "auto"],
+        default="auto",
+        help="Transport mechanism: ipc (same-node), rdma (cross-node), or auto",
+    )
+    args = parser.parse_args()
+
     # Configuration
     n_senders = 2
     n_receivers = 2
@@ -388,7 +403,7 @@ def main():
     n_warmup = 2
     n_iterations = 10
     n_streams = 4  # Number of CUDA streams for parallel copies
-    transport = "auto"  # "ipc", "rdma", or "auto"
+    transport = args.transport
 
     sender_gpu_ids = list(range(n_senders))
     receiver_gpu_ids = list(range(n_senders, n_senders + n_receivers))

@@ -21,15 +21,21 @@ This is more efficient because:
 Uses PyTorch DCP's resharding algorithm for overlap detection.
 """
 
+import argparse
 import logging
 import os
 from dataclasses import dataclass
 from functools import partial
 from typing import List, Tuple
 
+# Enable expandable segments for better memory management
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+
 import torch
 from monarch.actor import Actor, current_rank, endpoint, this_host
 from monarch.spmd import setup_torch_elastic_env
+
+from remote_tensor import RemoteTensor, Transport
 from torch.distributed._tensor import DTensor, Shard
 from torch.distributed.checkpoint.metadata import ChunkStorageMetadata
 from torch.distributed.checkpoint.resharding import (
@@ -37,8 +43,6 @@ from torch.distributed.checkpoint.resharding import (
     _shards_get_overlap_region_wrt_saved_tensor,
 )
 from torch.distributed.device_mesh import init_device_mesh
-
-from remote_tensor import RemoteTensor, Transport
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -220,6 +224,7 @@ def create_expected_slice(
 def set_cuda_device(gpu_ids: List[int]) -> None:
     """Bootstrap function to set CUDA_VISIBLE_DEVICES."""
     logging.basicConfig(level=logging.INFO)
+    os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in gpu_ids)
     os.environ["PHYSICAL_GPU_IDS"] = ",".join(str(g) for g in gpu_ids)
     rank = current_rank().rank
@@ -329,7 +334,7 @@ class Sender(Actor):
                 chunk_tensor,
                 owner=f"sender_{self.rank}_chunk_{receiver_rank}",
                 enable_ipc=True,
-                enable_rdma=False,
+                enable_rdma=True,
             )
             handles[receiver_rank] = handle
 
@@ -450,7 +455,9 @@ class Receiver(Actor):
             for i, (rt, receiver_slices) in enumerate(self.chunk_info):
                 stream = streams[i % n_streams]
                 with torch.cuda.stream(stream):
-                    rt.read_into(local_tensor[receiver_slices], transport=transport_enum)
+                    rt.read_into(
+                        local_tensor[receiver_slices], transport=transport_enum
+                    )
 
             for stream in streams:
                 stream.synchronize()
@@ -487,6 +494,16 @@ def main():
     """
     Main function demonstrating routed DTensor transfer via RemoteTensor.
     """
+    parser = argparse.ArgumentParser(description="DTensor Transfer Demo (Routed)")
+    parser.add_argument(
+        "--transport",
+        type=str,
+        choices=["ipc", "rdma", "auto"],
+        default="auto",
+        help="Transport mechanism: ipc (same-node), rdma (cross-node), or auto",
+    )
+    args = parser.parse_args()
+
     # Configuration
     n_senders = 2
     n_receivers = 2
@@ -494,7 +511,7 @@ def main():
     n_warmup = 2
     n_iterations = 10
     n_streams = 4
-    transport = "auto"
+    transport = args.transport
 
     sender_shard_dim = 0
     receiver_shard_dim = 1

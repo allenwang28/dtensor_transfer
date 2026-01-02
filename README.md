@@ -122,31 +122,34 @@ from torch.distributed.checkpoint.resharding import (
 
 **Hardware**: NVIDIA H100 80GB GPUs with NVSwitch (NV18 topology - 18 NVLinks per GPU)
 
-**Configuration**: 2 senders (GPUs 0-1) → 2 receivers (GPUs 2-3), 4 CUDA streams
+**Configuration**: 2 senders (GPUs 0-1) → 2 receivers (GPUs 2-3), 4 CUDA streams, 10 GB tensor
 
-### Gather Approach (10 GB tensor)
+### Summary
 
-| Metric | Value |
-|--------|-------|
-| Tensor size | 10,000 MB |
-| Mean time | 81.5 ms |
-| Std dev | 0.4 ms |
-| **Throughput** | **119.9 GB/s** |
+| Approach | Transport | Mean Time | Throughput |
+|----------|-----------|-----------|------------|
+| Gather | IPC | 71.9 ms | **135.8 GB/s** |
+| Gather | RDMA | 584.9 ms | 16.7 GB/s |
+| Routed | IPC | 33.0 ms | **296.3 GB/s** |
+| Routed | RDMA | 286.5 ms | 34.1 GB/s |
 
-### Routed Approach (10 GB tensor)
+### Key Observations
 
-| Metric | Value |
-|--------|-------|
-| Tensor size | 10,000 MB |
-| Mean time | 35.4 ms |
-| Std dev | 0.1 ms |
-| **Throughput** | **~280 GB/s** |
+1. **IPC vs RDMA (same-node)**: IPC is ~8-9x faster than RDMA
+   - IPC uses NVLink directly via CUDA IPC handles
+   - RDMA goes through the network stack even on same-node
 
-### Notes
+2. **Routed vs Gather**: Routed is ~2x faster for both transports
+   - Gather transfers the full tensor to each receiver (2x redundant data)
+   - Routed transfers only the exact chunks each receiver needs
 
-- Theoretical NVLink bandwidth: **450 GB/s** unidirectional per GPU pair
-- Current utilization: ~60-65% of theoretical peak
-- The gap is likely due to strided memory access patterns (column slicing) rather than contiguous transfers
+3. **Peak performance**: Routed + IPC achieves 296 GB/s
+   - ~66% of theoretical 450 GB/s NVLink bandwidth
+   - Gap likely due to strided memory access (column slicing)
+
+4. **RDMA throughput**: 17-34 GB/s is typical for InfiniBand HDR
+   - RDMA is designed for cross-node transfers where IPC isn't available
+   - Use `--transport auto` to prefer IPC when available
 
 ## Usage
 
@@ -159,11 +162,16 @@ uv pip install torchmonarch==0.2.0
 ### Running
 
 ```bash
-# Gather approach
+# Gather approach (default: auto transport)
 python gather.py
 
 # Routed/direct approach
 python routed.py
+
+# Specify transport explicitly
+python gather.py --transport ipc    # CUDA IPC (same-node)
+python gather.py --transport rdma   # RDMA (cross-node)
+python routed.py --transport auto   # Auto-select (prefers IPC)
 ```
 
 ### Configuration
